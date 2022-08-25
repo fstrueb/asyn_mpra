@@ -1,0 +1,337 @@
+---
+title: "07: DA peak overlap with ReMap 2022"
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(rtracklayer)
+library(data.table)
+library(GenomicRanges)
+library(enrichR)
+library(ggpubr)
+source('ggplot_theme_FLS.R')
+```
+
+```{r}
+pubfolder <- '/earth/public_data/'
+datafolder <- '/earth/SNCA_MPRA/'
+```
+
+```{r}
+res <- readRDS('06_export/results_filtered.rds')
+res.gr <- makeGRangesFromDataFrame(res, keep.extra.columns = TRUE)
+```
+
+## Import ReMap
+
+```{r}
+remap <- fread(paste0(pubfolder, 'remap/remap2022_nr_macs2_hg38_v1_0.bed'), sep = '\t', header = FALSE)
+```
+
+Number of unique Remap TFs:
+
+```{r}
+remap[,c("TF", "xyz") := tstrsplit(V4, ":", fixed=TRUE)]
+uniqueN(remap$TF)
+```
+
+
+```{r}
+# remap.df <- remap %>% tidyr::separate(X4, into = c('TF', 'cell'), sep = ':')
+remap.gr <- makeGRangesFromDataFrame(remap, seqnames.field = 'V1', start.field = 'V2', end.field = 'V3', strand.field = '*')
+ovs <- findOverlaps(res.gr, remap.gr, minoverlap = 20)
+```
+
+```{r}
+res_remap <- remap.gr[subjectHits(ovs)]
+mcols(res_remap) <- bind_cols(res[queryHits(ovs),], 
+                              remap %>% 
+                                  dplyr::select(TFcell = V4, color = V9) %>% 
+                                  dplyr::slice(subjectHits(ovs)) %>% 
+                                  tidyr::separate(TFcell, into = c('TF', 'cell'), sep = ':'))
+```
+
+<!-- Make GennomicRanges for overlap testing: -->
+
+<!-- ```{r} -->
+<!-- # remap.df <- remap %>% tidyr::separate(X4, into = c('TF', 'cell'), sep = ':') -->
+<!-- remap.gr <- makeGRangesFromDataFrame(remap, seqnames.field = 'X1', start.field = 'X2', end.field = 'X3', strand.field = '*') -->
+<!-- ovs <- findOverlaps(res.gr, remap.gr, minoverlap = 20) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- res_remap <- remap.gr[subjectHits(ovs)] -->
+<!-- mcols(res_remap) <- bind_cols(res[queryHits(ovs),],  -->
+<!--                               remap %>%  -->
+<!--                                   dplyr::select(TFcell = X4, color = X9) %>%  -->
+<!--                                   dplyr::slice(subjectHits(ovs)) %>%  -->
+<!--                                   tidyr::separate(TFcell, into = c('TF', 'cell'), sep = ':')) -->
+<!-- res_remap -->
+<!-- ``` -->
+
+## Enrichment test
+
+Use Fisher's exact test to ask the question: Is one particular TF overrepresented in significantly DA regions (versus all others)?
+
+```{r}
+temp <- as.data.frame(res_remap)
+mytfs <- unique(res_remap$TF)
+res_tfbs <- list()
+for (i in mytfs) {
+  i_fil <- temp %>% dplyr::filter(TF == i) %>% dplyr::count(significant)
+  mat1 <- i_fil %>% dplyr::filter(significant == 'yes') %>% dplyr::pull(n)
+  mat2 <- i_fil %>% dplyr::filter(significant == 'no') %>% dplyr::pull(n)
+  mat3 <- temp %>% dplyr::filter(significant == 'yes') %>% nrow()
+  mat4 <- temp %>% dplyr::filter(significant == 'no') %>% nrow()
+  mymat <- matrix(c(mat2, mat1, mat4 - mat2, mat3 - mat1), nrow = 2, ncol = 2)
+  if(all(dim(mymat) != c(2,2))) {
+    next 
+  } else{
+  res_tfbs[[i]] <- fisher.test(mymat)
+  }
+}
+rm(temp)
+```
+
+Consolidate the list:
+
+```{r}
+res_tfbs <- lapply(res_tfbs, function(x) {
+  ans <- data.frame(
+    pval = x$p,
+    ci_lo = x$conf.int[1],
+    ci_hi = x$conf.int[2],
+    or = x$estimate
+  )
+}) %>% rbindlist(., idcol = 'tf')
+```
+
+```{r}
+res_tfbs %>% 
+  # mutate(padj = p.adjust(pval, method = 'fdr')) %>% 
+  arrange(pval)
+```
+
+```{r}
+unique(remap[!TF %in% res_tfbs$tf]$TF)
+```
+
+Full figure (for supplements):
+
+```{r fig.height=10}
+res_tfbs %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  ggplot(aes(x = or, xmax = ci_hi, xmin = ci_lo, y = reorder(tf, -pval))) +
+  geom_point() +
+  geom_errorbar() +
+  scale_x_log10(breaks = c(0, 0.001, 0.01, 0.1,  1, 10, 100, 100)) +
+  labs(x = 'Odds Ratio', y = '', title = 'TF overrepresentation analysis') +
+  theme_FLS()
+```
+
+
+Reduced figure:
+
+```{r}
+mypal <- colorRampPalette(c('yellow', 'white', 'blue'))
+# res.gr$itemRgb <- '#7F7F7F'
+itemRgb <- mypal(100)
+```
+
+```{r}
+res_tfbs %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  slice_min(pval, n = 20) %>% 
+  ggplot(aes(x = or, xmax = ci_hi, xmin = ci_lo, y = reorder(tf, -pval))) +
+  geom_point() +
+  geom_errorbar() +
+  scale_x_log10() +
+  labs(x = 'Odds Ratio', y = '', title = 'TF overrepresentation analysis') +
+  theme_FLS()
+res_tfbs %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  slice_min(pval, n = 20) %>% 
+  ggplot(aes(x = as.factor(1), y = reorder(tf, -pval), fill = pval)) +
+  geom_raster(color = 'black') +
+  labs(x = '', y = '', fill = 'p-value') +
+  scale_fill_gradient(high = 'yellow', low = 'blue') +
+  theme_FLS()
+```
+
+
+
+## Enhancer vs Promoter tests
+
+Questions: Which TFs are more likely to occur in (significantly DA) enhancers vs. promoters? 
+
+Filter the table for significant and non-significant promoters and enhancers, and remove all TFs that do not occur in pairs (otherwise 2x2 contingency tables are impossible).
+
+```{r}
+res_sig <- as.data.frame(res_remap) %>% 
+    dplyr::filter(significant == 'yes' & ccre_simple %in% c('enhancer', 'promoter')) %>% 
+    group_by(TF, ccre_simple) %>% 
+    tally()
+length(unique(res_sig$TF))
+res_bg <- as.data.frame(res_remap) %>% 
+    dplyr::filter(significant == 'no' & ccre_simple %in% c('enhancer', 'promoter')) %>% 
+    group_by(TF, ccre_simple) %>% 
+    tally()
+length(unique(res_bg$TF))
+```
+
+```{r}
+setlist <- intersect(res_bg$TF, res_sig$TF)
+length(setlist)
+temp <- left_join(res_bg, res_sig, by = c('TF', 'ccre_simple')) %>% 
+    dplyr::count(TF) %>% 
+    dplyr::filter(n == 2)
+setlist <- na.omit(setlist[setlist %in% temp$TF])
+rm(temp)
+```
+
+Perform multiple Fisher's tests:
+
+```{r}
+ep_tfs <- list()
+for (i in setlist) {
+    temp <- as.data.frame(res_remap) %>% 
+        dplyr::filter(ccre_simple %in% c('enhancer', 'promoter') & TF == i) %>% 
+        dplyr::select(significant, TF, ccre_simple)
+    ep_tfs[[i]] <- fisher.test(table(temp$significant, temp$ccre_simple))
+}
+names(ep_tfs) <- setlist
+
+ep_tfs.df <- lapply(ep_tfs, function(x) {
+  ans <- data.frame(
+    pval = x$p,
+    ci_lo = x$conf.int[1],
+    ci_hi = x$conf.int[2],
+    or = x$estimate
+  )
+}) %>% rbindlist(., idcol = 'tf')
+ep_tfs.df %>% 
+    arrange(pval)
+```
+
+Attempt to annotate/classify TFs:
+
+```{r}
+mydbs <- listEnrichrDbs() %>% dplyr::filter(grepl(pattern = 'GO.*2021$|KEGG.*2021', x = libraryName))
+meth_anno <- ep_tfs.df %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  dplyr::pull(tf) %>% 
+  enrichr(., databases = 'GO_Molecular_Function_2021') %>% 
+  .[[1]] %>% 
+  dplyr::filter(grepl('GO:0008327|GO:0032452|GO:0001227|GO:0001228', Term)) %>% 
+  dplyr::select(Term, Genes) %>% 
+  tidyr::separate(Genes, into = c('hit1', 'hit2', 'hit3'), sep = ';') %>% 
+  pivot_longer(cols = starts_with('hit')) %>% dplyr::filter(!is.na(value)) %>% 
+  dplyr::select(Term, value)
+```
+
+```{r}
+ep_tfs.df <- ep_tfs.df %>% 
+  left_join(., meth_anno, by = c('tf' = 'value'))
+ep_tfs.df %>% arrange(pval)
+```
+
+
+```{r}
+ep_plot <- ep_tfs.df %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  ggplot(aes(x = or, xmax = ci_hi, xmin = ci_lo, y = reorder(tf, -or), color = str_wrap(Term, 45))) +
+  geom_point() +
+  geom_errorbar() +
+  scale_x_log10(breaks = c(0, 0.001, 0.01, 0.1,  1, 10, 100, 100)) +
+  theme_FLS() +
+  labs(x = 'Odds Ratio', y = '', title = 'TFs with enhancer/promoter preference', color = 'GO term') +
+  theme(axis.text.y = element_text(size = 14))
+ep_legend <- get_legend(ep_plot)
+ep_plot + guides(color = 'none')
+as_ggplot(ep_legend)
+ep_tfs.df %>% 
+  dplyr::filter(pval < 0.05) %>% 
+  ggplot(aes(x = as.factor(1), y = reorder(tf, -or), fill = pval)) +
+  geom_raster(color = 'black') +
+  labs(x = '', y = '', fill = 'p-value') +
+  scale_fill_gradient(high = 'yellow', low = 'blue') +
+  theme_FLS()
+```
+
+Obtain directionality:
+
+```{r}
+table(res_remap[res_remap$TF == 'SRSF7' & res_remap$significant == 'yes']$ccre_simple)
+```
+
+All SRSF7 in promoters, therefore x-axis to the right means TF motif preferentially present in promoters.
+
+Focus on SRSF7:
+
+```{r}
+temp <- as.data.frame(res_remap) %>% 
+  dplyr::filter(ccre_simple %in% c('enhancer', 'promoter') & TF == 'SRSF7') %>% 
+  dplyr::select(significant, TF, ccre_simple)
+table(temp$significant, temp$ccre_simple)
+rm(temp)
+```
+
+```{r}
+as.data.frame(res_remap) %>% 
+  dplyr::filter(ccre_simple %in% c('enhancer', 'promoter') & TF == 'SRSF7') %>% dplyr::filter(significant == 'yes')
+```
+
+
+
+<!-- ```{r} -->
+<!-- res_remap_updown <- as.data.frame(res_remap) %>%  -->
+<!--   dplyr::filter(significant == 'yes' & ccre_simple %in% c('enhancer', 'promoter')) %>%  -->
+<!--   dplyr::mutate(direction = ifelse(logFC > 0.5, 'up', 'down')) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- a <- as.data.frame(res_remap_updown) %>%  -->
+<!--     dplyr::filter(direction == 'up' & ccre_simple == 'promoter') -->
+<!-- b <- as.data.frame(res_remap_updown) %>%  -->
+<!--     dplyr::filter(direction == 'down' & ccre_simple == 'promoter') -->
+<!-- c <- as.data.frame(res_remap_updown) %>%  -->
+<!--     dplyr::filter(direction == 'up' & ccre_simple == 'enhancer') -->
+<!-- d <- as.data.frame(res_remap_updown) %>%  -->
+<!--     dplyr::filter(direction == 'down' & ccre_simple == 'enhancer') -->
+<!-- e <- Reduce(intersect, list(a$TF, b$TF, c$TF, d$TF)) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- strong_tfs <- list() -->
+<!-- for (i in e) { -->
+<!--     temp <- as.data.frame(res_remap_updown) %>%  -->
+<!--         dplyr::filter(TF == i) %>%  -->
+<!--         dplyr::select(ccre_simple, direction, TF) -->
+<!--     strong_tfs[[i]] <- fisher.test(table(temp$ccre_simple, temp$direction), alternative = 'two.sided') -->
+<!-- } -->
+<!-- names(strong_tfs) <- e -->
+<!-- # table(as.data.frame(strong_tfs) %>% gather() %>% pull(value) < 0.05) -->
+<!-- strong_tfs <- lapply(strong_tfs, function(x) { -->
+<!--   ans <- data.frame( -->
+<!--     pval = x$p, -->
+<!--     ci_lo = x$conf.int[1], -->
+<!--     ci_hi = x$conf.int[2], -->
+<!--     or = x$estimate -->
+<!--   ) -->
+<!-- }) %>% rbindlist(., idcol = 'tf') -->
+<!-- strong_tfs %>%  -->
+<!--     arrange(pval) -->
+<!-- ``` -->
+

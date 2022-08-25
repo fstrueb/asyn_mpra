@@ -1,0 +1,245 @@
+---
+title: '08: Overlap with published eQTLs'
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(GOplot)
+library(data.table)
+library(GenomicRanges)
+# library(enrichR)
+library(ggpubr)
+library(annotables)
+library(enrichplot)
+library(clusterProfiler)
+library(gghighlight)
+source('ggplot_theme_FLS.R')
+RhpcBLASctl::blas_set_num_threads(1)
+```
+
+```{r}
+pubfolder <- '/earth/public_data/'
+datafolder <- '/earth/SNCA_MPRA/'
+```
+
+```{r}
+res <- readRDS('06_export/results_filtered.rds')
+res.gr <- makeGRangesFromDataFrame(res, keep.extra.columns = TRUE) 
+```
+
+We use the GTEX eQTL CAVIAR or DAP-G database described here: <https://github.com/hakyimlab/gtex-gwas-analysis/blob/master/README.md> and downloaded directly from the UCSC table browser (hg38). BigeBed to Bed conversion was carried out with UCSCs `bigBedToBed`.
+
+```{r}
+gtex <- read_delim(paste0(pubfolder, 'gtex/gtexDapg.bed'), delim = '\t', col_names = NA) %>% 
+  dplyr::select(chrom = X1, eqtl_start = X7, eqtl_end = X8, gene_end = X3, gene_position = X15, gene_name = X16, tissue = X19, rsid = X14, pip = X20, color = X9)
+```
+
+```{r eval = FALSE}
+gtex.gr <- makeGRangesFromDataFrame(gtex, start.field = 'eqtl_start', end.field = 'eqtl_end', strand.field = '*')
+hits <- findOverlaps(res.gr, gtex.gr)
+gtex_ovs <- data.frame(
+  mpra_locus = res.gr[queryHits(hits)]$locus,
+  eqtl_pos = paste0(seqnames(gtex.gr[subjectHits(hits)]), ':', start(gtex.gr[subjectHits(hits)]), '-', end(gtex.gr[subjectHits(hits)])),
+  eqtl_gene = gtex[subjectHits(hits),]$gene_name,
+  eqtl_tissue = gtex[subjectHits(hits),]$tissue,
+  eqtl_rsid = gtex[subjectHits(hits),]$rsid,
+  eqtl_pip = gtex[subjectHits(hits),]$pip,
+  color = gtex[subjectHits(hits),]$color,
+  significant = res.gr[queryHits(hits)]$significant,
+  fdr = res.gr[queryHits(hits)]$fdr,
+  logFC = res.gr[queryHits(hits)]$logFC
+)
+saveRDS(gtex_ovs, '08_export/gtex_eqtl_mpra_overlaps.rds')
+```
+
+```{r}
+gtex_ovs <- readRDS('08_export/gtex_eqtl_mpra_overlaps.rds')
+```
+
+Number of genes overlapping any cis-eQTL:
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::select(eqtl_gene, eqtl_tissue, eqtl_pos) %>% 
+  dplyr::count(eqtl_gene)
+```
+
+For "Brain" only:
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(grepl('Brain', eqtl_tissue)) %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::mutate(direction = ifelse(logFC > 0, 'up', 'down')) %>% 
+  dplyr::select(eqtl_gene, eqtl_pos) %>% unique() %>% 
+  dplyr::count(eqtl_gene) 
+```
+
+```{r eval = FALSE}
+mydbs <- listEnrichrDbs() %>% dplyr::filter(grepl(pattern = 'GO.*2021$', x = libraryName))
+qtl_enrich <- gtex_ovs %>% dplyr::filter(significant == 'yes') %>% 
+  left_join(., grch38 %>% dplyr::select(entrez, symbol), by = c('eqtl_gene' = 'symbol')) %>% 
+  dplyr::pull(entrez) %>% 
+  unique() %>% na.omit()
+# enrichr(., mydbs$libraryName) %>% 
+# lapply(., function(x) x %>% dplyr::filter(Adjusted.P.value < 0.1))
+```
+
+```{r eval = FALSE}
+ego <- enrichGO(qtl_enrich, OrgDb = "org.Hs.eg.db", ont="ALL", readable=TRUE, pAdjustMethod = 'fdr', pvalueCutoff = 0.1, pool = TRUE)
+# dotplot(ego, split="ONTOLOGY", label_format = 50) + facet_grid(ONTOLOGY~., scale="free") + theme_FLS()
+```
+
+<!-- Prepare df for GO plotting: -->
+
+<!-- ```{r} -->
+<!-- temp <- mapply(function(x, y) { -->
+<!--   x %>% dplyr::select(Term, adj_pval = Adjusted.P.value, Genes) %>%  -->
+<!--              dplyr::mutate(Category = y) %>%  -->
+<!--              dplyr::mutate(Genes = str_replace_all(Genes, pattern = ';', replacement = ', ')) %>%  -->
+<!--     dplyr::mutate(ID = str_extract(Term, "\\([^()]+\\)")) %>%  -->
+<!--     dplyr::mutate(Term = str_remove(Term, "\\([^()]+\\)")) -->
+<!-- }, x = qtl_enrich, y = names(qtl_enrich), SIMPLIFY = FALSE) %>% rbindlist(.) -->
+<!-- gopl <- circle_dat(terms = temp, genes = gtex_ovs %>% dplyr::select(ID = eqtl_gene, logFC)) -->
+<!-- ``` -->
+
+<!-- GO plot: -->
+
+<!-- ```{r fig.height=5, fig.width=5, paged.print=TRUE} -->
+<!-- GOBubble(gopl, display = 'single', ID = T, labels = 2, table.legend = TRUE, bg.col = TRUE)  -->
+<!-- ``` -->
+
+
+```{r eval = FALSE}
+gtex_ovs %>% 
+  dplyr::filter(grepl('Brain', eqtl_tissue)) %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::mutate(direction = ifelse(logFC > 0, 'up', 'down')) %>% 
+  dplyr::select(eqtl_gene, direction, eqtl_pos) %>% unique() %>% 
+  dplyr::count(eqtl_gene, direction) %>% 
+  mutate(mydir = ifelse(direction == 'down', -n, n)) %>% 
+  ggplot(aes(x = reorder(eqtl_gene, mydir), y = mydir, fill = direction)) +
+  geom_col() +
+  theme_FLS() +
+  scale_y_continuous(breaks = c(-10, -5, 0, 5), labels = c(10, 5, 0, 5)) +
+  labs(x = '', y = '', title = 'Overlap with significant eQTLs', subtitle = 'by DA direction') +
+  theme(axis.text.x = element_text(size = 12, angle = 90))
+```
+
+```{r}
+gtex_ovs %>% dplyr::filter(grepl('nigra|ganglia', eqtl_tissue)) %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::select(mpra_locus, eqtl_gene, eqtl_pos) %>% 
+  dplyr::count(mpra_locus)
+gtex_ovs %>% dplyr::filter(grepl('nigra|ganglia', eqtl_tissue)) %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::filter(grepl('chr17', mpra_locus))
+```
+
+```{r}
+gtex_ovs %>% dplyr::filter(grepl('nigra|ganglia', eqtl_tissue)) %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::filter(grepl('chr16', mpra_locus))
+```
+
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(grepl('STK39|BORCS|MAPT|CRHR|BRIP1|INTS2', eqtl_gene)) %>% dplyr::filter(significant == 'yes')
+```
+
+```{r}
+res %>% dplyr::filter(locus == 'chr17_45897303_45897531_-')
+```
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(grepl('MAPT', eqtl_gene)) %>% 
+  dplyr::filter(significant == 'yes')
+```
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::filter(grepl('chr17_456', mpra_locus)) %>% 
+  arrange(fdr)
+```
+
+```{r}
+gtex_ovs %>% 
+  # mutate(direction = ifelse(logFC > 0, 'up', 'down')) %>% 
+  dplyr::filter(grepl('Brain', eqtl_tissue)) %>% 
+  group_by(significant) %>% 
+  dplyr::count(eqtl_tissue) %>% 
+  # pivot_wider(names_from = significant, values_from = n)
+  ggplot(aes(x = n, fill = significant, y = eqtl_tissue)) +
+  geom_col(position = 'fill') 
+```
+```{r}
+catal <- read_tsv(paste0(pubfolder, 'GWAS/EBI_GWAS_catalog_all_assocs_210428.tsv'), guess_max = 176421)
+keywords <- c('lewy|parkinson')
+gwas <- catal %>% 
+  dplyr::filter(grepl(keywords, x = `DISEASE/TRAIT`, ignore.case = TRUE)) %>% 
+  dplyr::select(PUBMEDID, trait = `DISEASE/TRAIT`, CHR_ID, CHR_POS, SNPS, `P-VALUE`, `OR or BETA`) %>% 
+  dplyr::mutate(group = case_when(
+    grepl('lewy', trait, ignore.case = TRUE) ~ 'Lewy',
+    grepl('parkinson', trait, ignore.case = TRUE) ~ 'Parkinson')
+  ) %>% 
+  dplyr::filter(!is.na(CHR_ID)) %>% 
+  dplyr::filter(CHR_ID %in% c(seq(1, 22), 'X', 'M', 'MT', 'Y')) %>% 
+  dplyr::select(seqnames = CHR_ID, start = CHR_POS, end = CHR_POS, everything()) %>% 
+  dplyr::mutate(range_id = paste0('chr', seqnames, '_', start))
+```
+
+```{r}
+temp <- gtex %>% dplyr::filter(rsid %in% gwas$SNPS) 
+
+temp %>% dplyr::count(tissue) %>% 
+  ggplot(aes(x = n, y = reorder(tissue, -n))) +
+  geom_col()
+```
+
+```{r}
+gtex_ovs %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::select(eqtl_pos, eqtl_tissue, eqtl_gene, eqtl_rsid, eqtl_rsid) %>% 
+  unique() %>% 
+  dplyr::count(eqtl_tissue) %>% 
+  ggplot(aes(x = n, y = reorder(eqtl_tissue, -n))) +
+  geom_col()
+```
+
+Make composite for heatmap:
+
+```{r}
+my_ovs <- gtex_ovs %>% 
+  dplyr::filter(significant == 'yes') %>% 
+  dplyr::select(eqtl_pos, eqtl_tissue, eqtl_gene, eqtl_rsid, eqtl_rsid) %>% 
+  unique() %>% 
+  dplyr::count(eqtl_tissue, name = 'n_mpra') %>% 
+  mutate(MPRA = row_number(-n_mpra)) %>% 
+  left_join(., temp %>% dplyr::count(tissue, name = 'n_rsid') %>% mutate(RSID = row_number(-n_rsid)) , by = c('eqtl_tissue' = 'tissue')) %>% 
+  dplyr::select(eqtl_tissue, RSID, MPRA) %>% 
+  pivot_longer(-eqtl_tissue)
+my_ovs %>% ggplot(aes(x = factor(name, levels = c('MPRA', 'RSID')), y = value, group = eqtl_tissue)) +
+  geom_line(aes(color = eqtl_tissue), size = 2, alpha = 0.7) +
+  geom_point(size = 4, alpha = 0.5) +
+  gghighlight(grepl('ganglia|nigra|Cerebellum', eqtl_tissue), label_params = list(nudge_x = -0.25, nudge_y =0, direction = 'y', max.time = 1, max.overlaps = 10)) +
+  labs(x = '', y = 'Rank', title = 'Ranking of eQTL relevance') +
+    coord_flip()+
+  theme_FLS() +
+  theme(panel.grid.major = element_blank())
+```
+
+

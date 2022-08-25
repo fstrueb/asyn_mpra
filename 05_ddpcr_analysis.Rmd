@@ -1,0 +1,154 @@
+---
+title: '05: ddPCR data'
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+source('ggplot_theme_FLS.R')
+```
+
+## SNCA expression 
+
+```{r}
+snca <- read_delim('05_import/220422_SNCA-GFP_exp_forFF_SNCA5000manuallycorrected.csv', delim = ';', locale = locale(decimal_mark = ',')) %>% 
+    dplyr::select(primer = `Sample description 1`, sample = `Sample description 2`, template = `Sample description 3`, copies = `Conc(copies/µL)`, copies_max = PoissonConfMax, copies_min = PoissonConfMin, channel = `DyeName(s)`) %>% 
+    dplyr::filter(template == 'cDNA' & copies != 'No Call' & channel == 'FAM') %>% 
+    mutate_at(vars(copies), function(x) {readr::parse_number(x, locale = locale(decimal_mark = ','))}) %>% 
+    mutate(group = str_sub(sample, end = -2L))
+    # mutate(copies = as.numeric(copies), copies_min = as.numeric(copies_min), copies_max = as.numeric(copies_max))
+    # dplyr::filter(Status == 'Manual' & `Sample description 3` == 'cDNA')
+```
+
+```{r}
+snca %>% 
+    ggplot(aes(x = sample, y = copies, ymax = copies_max, ymin = copies_min, fill = group)) +
+    geom_col(color = 'black') +
+    geom_errorbar(width = 0.2) +
+    labs(x = '', y = 'Copies/µL', title = 'SNCA RNA/transcript abundance') +
+    scale_fill_discrete(guide = 'none') +
+    coord_flip() +
+  theme_FLS()
+```
+
+```{r fig.width=5, fig.height=5}
+snca %>% 
+    ggplot(aes(x = group, y = copies, fill = group)) +
+    geom_boxplot() +
+    geom_point(alpha = 0.5, size = 3) +
+    stat_compare_means(comparisons = list(c('GFP', 'SNCA')), method = 't.test', method.args = list(alternative = 'less'), label.y = 52, label = 'p.signif', size= 6 ) +
+    scale_fill_discrete(guide = 'none') +
+    labs(x = '', y = 'Copies/µL') +
+    ylim(0, 60) +
+  labs(title = 'Average SNCA expression') +
+    theme_FLS()
+```
+
+p = 1.2e-05
+****: p <= 0.0001
+
+```{r}
+snca %>% 
+    group_by(group) %>% 
+    summarize(`Average copies/µL` = mean(copies), sd = sd(copies)) %>% 
+    ggplot(aes(x = group, y = `Average copies/µL`)) +
+    geom_col()
+```
+
+## RNA expression validation experiment (MAPT)
+
+```{r}
+ddpcr <- read_csv('05_import/220531_FLS_SNCA_MPRA_evagreen_20220601_085652_197.csv') %>% 
+    dplyr::select(Status, sample = `Sample description 1`, primer = `Sample description 2`, copiesul = `Conc(copies/µL)`, accepted = `Accepted Droplets`, poisson_max = `PoissonConfMax`, poisson_min = `PoissonConfMin`) %>% 
+    dplyr::filter(Status == 'Manual') %>% 
+    dplyr::mutate(copiesul = as.numeric(copiesul)) %>% 
+    mutate(group = ifelse(grepl('GFP', sample), 'GFP', 'SNCA'))
+    # dplyr::filter(sample != 'SNCA_6')
+```
+
+```{r}
+ddpcr %>% group_by(primer, group) %>% 
+    summarize(mean_concentration = mean(copiesul), sd = sd(copiesul))
+```
+
+```{r fig.height=4}
+library(ggpubr)
+ddpcr %>% 
+    # dplyr::filter(primer %in% c('MAPT', 'CRHR1')) %>% 
+    ggboxplot(., x = 'group', y = 'copiesul', color = 'group', add = 'jitter') + 
+  facet_wrap(~primer, scales = 'free', strip.position = 'top') + 
+  stat_compare_means(comparisons = list(c('SNCA', 'GFP')), method = 't.test') +
+  scale_color_discrete(guide = 'none') +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = 'Copies per µL', x = '') +
+  theme_FLS()
+```
+
+```{r}
+ddpcr %>% dplyr::count(sample, primer)
+```
+
+
+<!-- Load annotated results table: -->
+
+<!-- ```{r} -->
+<!-- res_anno <- readRDS('16_export/results_table_annotated_nearest_ontarget.rds') -->
+<!-- res_anno %>%  -->
+<!--     as.data.frame(.) %>%  -->
+<!--     dplyr::filter(gene_name %in% c('MAPT', 'STK39', 'BORCS7', 'GBF1', 'BRIP1', 'INTS2', 'CRHR1')) -->
+<!-- ``` -->
+
+<!-- Cross-correlate RNA count matrix to see if cells expressing CREs in MAPT region are correlated: -->
+
+<!-- ```{r} -->
+<!-- RNA_mat <- readRDS('13_export/RNA_count_matrix.rds') -->
+<!-- dim(RNA_mat) -->
+<!-- RNA_mat_fil <- RNA_mat[rownames(RNA_mat) %in% res_anno$seq,] -->
+<!-- RNA_mat_cor <- t(RNA_mat_fil) -->
+<!-- myres <- cor(RNA_mat_cor, RNA_mat_cor) -->
+<!-- dim(myres) -->
+<!-- ``` -->
+
+<!-- make heatmap to visualize clusters, here ordered by locus position to see if REs in TADs are co-regulated -->
+
+<!-- ```{r fig.width = 8} -->
+<!-- ordervec <- as.data.frame(res_anno) %>% dplyr::select(locus, seq) %>% arrange(locus) -->
+<!-- myres_ordered <- myres[order(match(rownames(myres), ordervec$seq)),order(match(colnames(myres), ordervec$seq))] -->
+<!-- all(rownames(myres_ordered) == ordervec$seq) -->
+<!-- all(colnames(myres_ordered) == ordervec$seq) -->
+<!-- pheatmap::pheatmap(myres_ordered, show_colnames = FALSE, show_rownames = FALSE, cluster_rows = FALSE, cluster_cols = FALSE) -->
+<!-- ``` -->
+<!-- ```{r fig.width = 14} -->
+<!-- library(superheat) -->
+<!-- mycols <- str_sub(ordervec$locus, end = 5L) -->
+<!-- dim(myres_ordered) -->
+<!-- myres_ordered_fil <- myres_ordered[mycols == 'chr19', mycols == 'chr19'] -->
+<!-- mycols <- mycols[mycols == 'chr19'] -->
+<!-- myrows <- mycols[mycols == 'chr19'] -->
+<!-- dim(myres_ordered_fil) -->
+<!-- superheat(myres_ordered_fil, scale = FALSE, membership.cols = mycols) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- mapt <- as.data.frame(myres['TCAGTCGCAGCCCCA',]) %>%  -->
+<!--     add_rownames() %>%  -->
+<!--     dplyr::select(rowname, pearson = 2) %>%  -->
+<!--     arrange(-pearson) -->
+<!-- qplot(mapt$pearson) + labs(title = 'Distribution of Pearson r barcodes for MAPT enhancer') -->
+<!-- ``` -->
+<!-- ```{r} -->
+<!-- mapt %>% left_join(., as.data.frame(res_anno), by = c('rowname' = 'seq')) %>%  -->
+<!--     dplyr::filter(grepl('chr17:45', locus)) -->
+<!-- ``` -->
+

@@ -1,0 +1,137 @@
+---
+title: '02: Extracting RE and barcode correspondence from sequencing files'
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(parallel)
+library(tools)
+library(tidyverse)
+library(data.table)
+setDTthreads(80L)
+source('extract_blathits.R')
+```
+
+```{r}
+pubfolder <- '/earth/public_data/'
+datafolder <- '/earth/SNCA_MPRA/'
+```
+
+## Extracting REs using BLAT
+
+```{r}
+fastas <- list.files(paste0(datafolder, 'correspondence'), pattern = 'fasta$', full.names = TRUE)
+```
+
+Parallelized BLAT is used to extract regulatory elements in a tabular format:
+
+```{r eval = FALSE}
+lapply(fastas, function(x) {
+    system(paste0('pblat ', pubfolder, 'fasta/human/UCSC/GRCh38.primary_assembly.genome.fa ', x, ' -threads=70 -minIdentity=95 -out=blast8 ', datafolder, 'correspondence/blast8/', basename(x), '.blast8'))
+})
+```
+
+Hits are extracted in batches from the blast8-formatted files using the script `extract_blathits.R`:
+
+```{r eval = FALSE}
+filelist <- list.files(paste0(datafolder, 'correspondence/blast8'), pattern = '.blast8$', full.names = TRUE)
+extract_blathits(filelist[1:2], datafolder)
+extract_blathits(filelist[3:4], datafolder)
+extract_blathits(filelist[5:6], datafolder)
+extract_blathits(filelist[7:8], datafolder)
+extract_blathits(filelist[9:10], datafolder)
+extract_blathits(filelist[11:12], datafolder)
+extract_blathits(filelist[13:14], datafolder)
+extract_blathits(filelist[15:16], datafolder)
+extract_blathits(filelist[17:18], datafolder)
+extract_blathits(filelist[19:20], datafolder)
+extract_blathits(filelist[21:22], datafolder)
+extract_blathits(filelist[23:24], datafolder)
+```
+
+Results from the BLAT analysis are concatenated:
+
+```{r eval = FALSE}
+blatfiles <- list.files(paste0(datafolder, 'blat_results'), pattern = glob2rx('regs_blat*'), full.names = TRUE)
+regs_all <- lapply(blatfiles, fread, nThread = 80L, sep = '\t', header = TRUE) %>% rbindlist(idcol = 'origin')
+fwrite(regs_all, paste0(datafolder, 'blat_results/regs_blat_filtered_all_concatenated.tsv'), nThread = 80L, append = FALSE, sep = '\t')
+```
+
+## Extracting barcodes using seqkit
+
+Barcodes are extracted based on flanking sequences using the following function:
+
+```{r eval = FALSE}
+extract_sequence <- function(file, primer_fwd, primer_rev) {
+    filename <- str_extract(file, '^(.*?)R[1,2]')
+        system(paste('conda run -n seqkit seqkit amplicon', file, 
+                     '-R', primer_fwd,
+                     '-F', primer_rev, 
+                     '-r 11:-11 -m2 --bed -s -j 8',
+                     # ' -f -r 1:15 -m2 --bed -s',
+                     '-o', paste0(datafolder, 'correspondence/', basename(filename), '_barcodes_v2.bed')
+        ))
+}
+```
+
+Primers for the barcode extraction are given here:
+
+```{r}
+bc_fwd <- c('GCCACGTCCC')
+bc_rev <- c('CATGCGGTTT')
+```
+
+The `extract_sequence` function is applied in parallel to all raw fastq files:
+
+```{r eval = FALSE}
+fastqs <- list.files(paste0(datafolder, 'fastqs'), pattern = 'fastq.gz$', full.names = TRUE)
+mclapply(fastqs, extract_sequence, bc_fwd, bc_rev, mc.cores = 10L)
+```
+
+All extracted barcodes are concatenated :
+
+```{r eval = FALSE}
+barcodes <- lapply(list.files(paste0(datafolder, 'correspondence'), pattern = 'barcodes_v2.bed', full.names = TRUE), fread, sep = '\t', header = FALSE) %>% rbindlist(.)
+```
+
+<!-- ```{r} -->
+<!-- uniqueN(barcodes$V1) -->
+<!-- uniqueN(barcodes$V7) -->
+<!-- ``` -->
+
+If more than one barcode is found within a given read, discard both:
+
+```{r eval = FALSE}
+barcodes <- unique(barcodes, by = 'V1')
+```
+
+Only accept barcodes that are within a given tolerance window within the read and remove any barcode with an "N" in the sequence:
+
+```{r eval = FALSE}
+barcodes <- barcodes[V6 == '+', .(qname = V1, start = V2, end = V3, V6, seq = V7)]
+barcodes <- barcodes[between(start, 24, 28) & between(end, 39, 43), .(qname, seq), ]
+barcodes[, hasn := grepl(pattern = 'N', x = seq), ]
+barcodes <- barcodes[hasn == FALSE, .(qname, seq), ]
+head(barcodes)
+```
+
+## Join tables
+
+Join the barcode and BLAT tables for correspondence and save the results:
+
+```{r eval = FALSE}
+correspondence <- regs_all[barcodes, on = .(qname = qname), nomatch = NULL]
+fwrite(correspondence, paste0(datafolder, 'blat_results/correspondence_table_unfiltered.tsv'), sep = '\t')
+```
+
+
+

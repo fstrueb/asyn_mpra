@@ -1,0 +1,148 @@
+---
+title: "03: Extracting LUHMES MPRA barcodes"
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(Biostrings)
+library(parallel)
+library(ShortRead)
+library(tools)
+setDTthreads(80)
+```
+
+```{r}
+pubfolder <- '/earth/public_data/'
+datafolder <- '/earth/SNCA_MPRA/'
+```
+
+## Extracting barcodes
+
+Barcodes are extracted based on flanking sequences. Different primer pairs are used depending on the orientation of the read. The orientation of the read is determined by extracting reads starting with "ACC" or "CTT" (corresponding to the 5' or 3' end of the amplicon), respectively:
+
+```{r eval = FALSE}
+fastqs <- list.files(paste0(datafolder, 'LUHMES_fastqs'), pattern = '.fastq$', full.names = TRUE)
+lapply(fastqs, function(x) {
+    system(paste0('conda run -n seqkit seqkit grep -s -i -r -p ^ACC -o ', file_path_sans_ext(x), '_rev_extracted.fastq ', x))
+    system(paste0('conda run -n seqkit seqkit grep -s -i -r -p ^CTT -o ', file_path_sans_ext(x), '_fwd_extracted.fastq ', x))
+})
+```
+
+Extract barcodes based on flanking sequences using `seqkit`:
+
+```{r}
+extract_sequence <- function(file, primerlist) {
+    filename <- file_path_sans_ext(file)
+    primer_fwd <- ifelse(grepl('fwd', filename), as.character(primerlist$R1_fwd), as.character(primerlist$R2_fwd))
+    primer_rev <- ifelse(grepl('rev', filename), as.character(primerlist$R2_rev), as.character(primerlist$R1_rev))
+    region = ifelse(grepl('fwd', filename), c('15:-12'), c('15:-15'))
+    system(paste('conda run -n seqkit seqkit amplicon', file, 
+                 '-F', primer_fwd, 
+                 '-R', primer_rev,
+                 '-r ', region, ' -m0 --bed -s -j 8',
+                 # ' -f -r 1:15 -m2 --bed -s',
+                 '-o', paste0(datafolder, 'LUHMES_amplicons/', basename(filename), '_barcodes_v2.bed')
+    ))
+    return(paste0(filename, '_barcodes_v2.bed'))
+}
+```
+
+The `extract_sequence` function is applied to all strand-specific files:
+
+```{r}
+exfiles <- list.files(paste0(datafolder, 'LUHMES_fastqs'), pattern = 'extracted.fastq$', full.names = TRUE)
+myprimers <- readRDS('03_import/primers_for_LUHMES_barcode_extraction.rds')
+myprimers
+```
+
+```{r eval = FALSE}
+mclapply(exfiles, extract_sequence, primerlist = myprimers, mc.cores = 10L)
+```
+
+## Concatenating and removing ambiguous barcodes
+
+Extracted barcodes are concatenated:
+
+```{r message = FALSE}
+barcodes <- lapply(list.files(paste0(datafolder, 'LUHMES_amplicons'), pattern = '.bed$', full.names = TRUE), function(x) {
+   ans <- fread(x, header = FALSE, sep = '\t')
+   ans[, origin := basename(x)]
+}) %>% rbindlist(.)
+bcs <- barcodes[, .(V1, V2, V3, V6, V7, origin)]
+setnames(bcs, old = names(bcs), new = c('qname', 'start', 'end', 'strand', 'seq', 'origin'))
+bcs[, c('group', 'replicate', 'sample') := tstrsplit(origin, '-', fixed = TRUE)]
+bcs[, c('nacid') := tstrsplit(sample, '_', fixed = TRUE)[1]]
+head(bcs)
+```
+
+The total number of reads per nucleic acid was:
+
+```{r}
+table(bcs$nacid)
+```
+
+
+Reads that had more than one barcode are removed:
+
+```{r}
+bcs <- unique(bcs, by = 'qname')
+table(bcs$nacid)
+```
+
+All ambiguous barcodes (containing an "N") are removed:
+
+```{r}
+bcs_fil <- bcs[!grepl('N', seq),]
+```
+
+The strand information needs to be corrected:
+
+```{r}
+table(bcs_fil$nacid, bcs_fil$strand)
+```
+
+Strand is corrected based on the filename:
+
+```{r}
+bcs_fil[, strand := ifelse(grepl('fwd', sample), '+', '-')]
+table(bcs_fil$nacid, bcs_fil$strand)
+```
+
+<!-- Number of unique barcodes after filtering: -->
+
+<!-- ```{r} -->
+<!-- uniqueN(bcs_fil$seq) -->
+<!-- ``` -->
+
+The barcode sequence also needs to be corrected according to the strand information:
+
+```{r}
+bcs_fil[, seq := ifelse(strand == '-', seq, as.character(reverseComplement(DNAStringSet(seq))))]
+```
+
+<!-- Number of unique barcodes after filtering: -->
+
+<!-- ```{r} -->
+<!-- uniqueN(bcs_fil$seq) -->
+<!-- ``` -->
+
+The result is saved:
+
+```{r eval = FALSE}
+fwrite(bcs_fil, paste0(datafolder, 'LUHMES_barcodes/bcs_filtered_strandcorrected.tsv'), sep = '\t')
+```
+
+```{r}
+head(bcs_fil)
+```

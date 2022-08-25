@@ -1,0 +1,108 @@
+---
+title: '09: Transcriptome overlap'
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(illuminaHumanv3.db)
+library(GenomicRanges)
+library(pheatmap)
+source('ggplot_theme_FLS.R')
+```
+
+```{r}
+pubfolder <- '/earth/public_data/'
+datafolder <- '/earth/SNCA_MPRA/'
+```
+
+```{r}
+res <- readRDS('06_export/results_filtered.rds')
+# res.gr <- makeGRangesFromDataFrame(res, keep.extra.columns = TRUE) 
+gtex_ovs <- readRDS('08_export/gtex_eqtl_mpra_overlaps.rds')
+```
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE191302
+
+```{r}
+bead <- read_delim('09_import/GSE191302_normalized.txt', delim = '\t') %>% 
+    dplyr::select(1, starts_with('Sample')) 
+```
+
+Map symbols to identifiers:
+
+```{r}
+columns(illuminaHumanv3.db)
+mysymbols <- AnnotationDbi::select(illuminaHumanv3.db, keys = bead$`ID_REF `, columns = c('SYMBOL', 'PROBEID'), keytype = 'PROBEID')
+```
+
+
+
+Consider testing all overlaps first, then filtering:
+
+```{r}
+qtl_symbols <- mysymbols %>% dplyr::filter(SYMBOL %in% unique(gtex_ovs %>% dplyr::filter(significant == 'yes') %>% dplyr::pull(eqtl_gene)))
+res <- bead %>% 
+  dplyr::filter(`ID_REF ` %in% qtl_symbols$PROBEID) %>% 
+  pivot_longer(-`ID_REF `) %>%
+    mutate(group = ifelse(name %in% c('Sample_1', 'Sample_2', 'Sample_3'), 'SNCA', 'GFP')) %>%
+    group_by(`ID_REF `) %>%
+    do(broom::tidy(lm(value ~ group, data = .))) %>% # convenient one-liner to fit linear models by probe, results almost exactly the same as reported in the Hoellerhage paper (limma uses a comparable model)
+  dplyr::filter(term == 'groupSNCA') # discard the intercept column
+```
+
+```{r}
+bead %>% dplyr::filter(`ID_REF ` %in% qtl_symbols$PROBEID) %>% 
+    dplyr::mutate(mean_expr = rowMeans(dplyr::select(., starts_with('Sample')))) %>% 
+    dplyr::filter(mean_expr > 8) %>% 
+    dplyr::select(-1, -mean_expr) %>% 
+    as.matrix(.) %>% 
+    pheatmap::pheatmap(cluster_rows = TRUE)
+```
+
+```{r}
+qtl_ovs <- res %>% dplyr::filter(p.value < 0.05) %>%
+    left_join(., mysymbols, by = c('ID_REF ' = 'PROBEID'))
+qtl_ovs %>% dplyr::pull(SYMBOL) %>%  unique()
+```
+
+```{r}
+temp <- bead %>% dplyr::filter(`ID_REF ` %in% qtl_symbols$PROBEID) %>% 
+    left_join(., mysymbols, by = c('ID_REF ' = 'PROBEID')) %>% 
+    dplyr::filter(`ID_REF ` %in% qtl_ovs$`ID_REF `)
+    # dplyr::select(-1, -SYMBOL)  
+plotmat <- as.matrix(temp %>% dplyr::select(-1, -SYMBOL))
+rownames(plotmat) <- temp$SYMBOL
+anno_col <- data.frame(sample = colnames(plotmat), group = c('GFP', 'GFP', 'GFP', 'SNCA', 'SNCA', 'SNCA')) %>% column_to_rownames(sample)
+plotmat %>% pheatmap(cluster_rows = TRUE, annotation_col = anno_col) 
+```
+
+
+Compare this result to the list with brain-specific QTLs:
+
+```{r}
+qtl_symbols_brain <- mysymbols %>% dplyr::filter(SYMBOL %in% unique(gtex_ovs %>% dplyr::filter(significant == 'yes') %>% dplyr::filter(grepl('Brain', eqtl_tissue)) %>%  dplyr::pull(eqtl_gene)))
+res_brain <- bead %>% 
+  dplyr::filter(`ID_REF ` %in% qtl_symbols_brain$PROBEID) %>% 
+  pivot_longer(-`ID_REF `) %>%
+    mutate(group = ifelse(name %in% c('Sample_1', 'Sample_2', 'Sample_3'), 'SNCA', 'GFP')) %>%
+    group_by(`ID_REF `) %>%
+    do(broom::tidy(lm(value ~ group, data = .))) %>% # convenient one-liner to fit linear models by probe, results comparable to Hoellerhage paper
+  dplyr::filter(term == 'groupSNCA') # discard the intercept column
+```
+
+```{r}
+res_brain %>% dplyr::filter(p.value < 0.05) %>% 
+  left_join(., mysymbols, by = c('ID_REF ' = 'PROBEID')) %>% 
+  dplyr::pull(SYMBOL) %>% unique()
+```
+

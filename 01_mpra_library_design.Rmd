@@ -1,0 +1,319 @@
+---
+title: '01: GWAS/ENCODE3 cRE extraction for alpha-synucleinophathy relevant hits'
+author: "felix.struebing@med.uni-muenchen.de"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message = FALSE}
+library(tidyverse)
+library(rtracklayer)
+library(BSgenome.Hsapiens.UCSC.hg38)
+```
+```{r}
+pubfolder <- '/earth/public_data/'
+```
+
+
+## GWAS to baits
+
+### Import GWAS catalogue
+
+which was downloaded from the EMBL-EBI website on 2021-04-28: <https://www.ebi.ac.uk/gwas/>
+
+```{r message = FALSE, WARNING = FALSE}
+catal <- read_tsv(paste0(pubfolder, 'GWAS/EBI_GWAS_catalog_all_assocs_210428.tsv'), guess_max = 176421)
+```
+
+Define keywords for filtering the associations:
+
+```{r}
+keywords <- c('lewy|parkinson')
+gwas <- catal %>% 
+    dplyr::filter(grepl(keywords, x = `DISEASE/TRAIT`, ignore.case = TRUE)) %>% 
+    dplyr::select(PUBMEDID, trait = `DISEASE/TRAIT`, CHR_ID, CHR_POS, SNPS, `P-VALUE`, `OR or BETA`) %>% 
+    dplyr::mutate(group = case_when(
+        # grepl('alz',  trait, ignore.case = TRUE) ~ 'Alzheimer',
+        grepl('lewy', trait, ignore.case = TRUE) ~ 'Lewy',
+        grepl('parkinson', trait, ignore.case = TRUE) ~ 'Parkinson')
+    )
+```
+
+Table of hits per keyword:
+
+```{r}
+gwas %>% dplyr::count(group)
+```
+
+Table of each association:
+
+```{r}
+gwas %>% dplyr::count(trait) %>% 
+    arrange(-n) %>% knitr::kable()
+```
+
+Some SNPs will be reported more than once, since multiple studies will have found the same associations. 
+Number of mutually exclusive variants:
+
+```{r}
+gwas %>% dplyr::pull(SNPS) %>% unique() %>% length(.)
+```
+
+Some SNPs did not reach genome-wide significance level 5*10^-8, we still want to include them:
+
+```{r}
+gwas %>% mutate(genomewide_sig = ifelse(`P-VALUE` < 5*10^-8, 'sig', 'nonsig'),
+                is_dup = ifelse(duplicated(SNPS), 'yes', 'no')) %>% 
+  dplyr::count(genomewide_sig, is_dup)
+max(gwas$`P-VALUE`)
+```
+
+
+Check the resulting table for incomplete observations:
+
+```{r}
+skimr::skim(gwas)
+```
+
+A few associations do not have a SNP ID (rsID):
+
+```{r}
+gwas %>% dplyr::filter(is.na(CHR_ID))
+```
+
+Final filtering; remove all strange chromosomes and assign unique names:
+
+```{r}
+gwas <- gwas %>% dplyr::filter(!is.na(CHR_ID)) %>% 
+    dplyr::filter(CHR_ID %in% c(seq(1, 22), 'X', 'M', 'MT', 'Y')) %>% 
+    dplyr::select(seqnames = CHR_ID, start = CHR_POS, end = CHR_POS, everything()) %>% 
+    dplyr::mutate(range_id = paste0('chr', seqnames, '_', start))
+gwas.gr <- makeGRangesFromDataFrame(gwas, keep.extra.columns = TRUE)
+seqlevelsStyle(gwas.gr) <- 'UCSC'
+gwas.gr
+```
+
+
+### Add custom regions
+
+#### SNCA locus
+
+It would be interesting to cover the whole SNCA locus. Roughly extract the locus based n HiC contact points:
+![snca](01_import/hgt_genome_euro_19a3e_26ac30.pdf)
+
+```{r}
+goi_snca <- GRanges(seqnames = 'chr4', IRanges(start = 89412000, end = 89966200), trait = 'snca', group = 'custom', range_id = 'snca')
+```
+
+#### LBD WGS study
+
+Not yet in the GWAS catalogue: <https://www.nature.com/articles/s41588-021-00785-3>
+![Table1](01_import/Screen Shot 2021-05-05 at 13.03.54.png)
+
+```{r}
+goi_lbd <- c(
+    GRanges(seqnames = 'chr2', IRanges(start = 127100000, end= 127170000), trait = 'LBD_WGS', group = 'Lewy', rangeid = 'LBD_WGS_BIN1'),
+    GRanges(seqnames = 'chr4', IRanges(start = 932110, end = 959000), trait = 'LBD_WGS', group = 'Lewy', rangeid = 'LBD_WGS_TMEM175')
+)
+```
+
+
+### Concatenate custom regions
+
+```{r}
+cus <- c(goi_snca, goi_lbd)
+```
+
+### Define contiguous intervals
+
+Often, a reported ("lead" or "tag") SNP in GWAS might not be the causal variant, since generally genotyping arrays are used that only include common SNPs that might be in strong LD with the common variant. Defining LD intervals (e.g. r squared > 0.8) is not always feasible, since the regions might be extremely big, or no intervals can be defined since the SNPs are too new for accurate population-based proxy analysis.
+However, it is estimated that at least 80% of causal common GWAS variants are within 33.5 kbp of the lead SNP:  <https://genomebiology.biomedcentral.com/track/pdf/10.1186/s13059-017-1216-0.pdf>. See Figure 2 from this paper:
+
+![fig2](01_import/Screen Shot 2021-04-30 at 11.45.31.png)
+
+Therefore, let's set this cutoff to resize our single-position SNPs to ranges for that size. 
+
+```{r}
+cutoff <- 70000
+head(gwas.gr)
+saveRDS(gwas.gr, '01_export/gwas_granges_for_design.rds')
+```
+
+This is the resizing process. Note that the single-position SNPs are anchored to the center before resizing; i.e. the range is expanded symmetrically.
+
+```{r}
+gwas_resized <- gwas.gr %>% resize(., width = cutoff, fix = 'center')
+head(gwas_resized)
+```
+
+### Concatenate all regions
+
+```{r}
+gwas_resized <- c(gwas_resized, cus)
+```
+
+## ENCODE cRE overlap
+
+We now subset the previously defined continuous ranges for cis-regulatory elements (cREs) from the ENCODE3 consortium. The Encode3 CRE collection features different tissue types:
+
+```{r}
+metad <- read_tsv(paste0(pubfolder, 'encode3/DHS_Index_and_Vocabulary_metadata.tsv'))
+metad %>% dplyr::count(System) %>% arrange(-n) %>% knitr::kable()
+```
+
+Let's filter for Nervous system specific cREs:
+
+```{r}
+metad <- metad %>% dplyr::filter(System == 'Nervous')
+```
+
+Import the presence/absence matrix from the ENCODE3 project:
+
+```{r}
+load(paste0(pubfolder, 'encode3/dat_bin_FDR01_hg38.RData'))
+cres <- dat_bin
+rm(dat_bin)
+colnames(cres) <- sapply(str_split(colnames(cres), pattern = '\\.'), function(x) x[[2]])
+```
+
+Filter biosamples from the CRE table, remove any ranges with fewer CRE occurences than `min_samples`, and turn this binary matrix into GRanges for overlap calculation:
+
+```{r}
+min_samples <- 11
+cres <- cres[,metad$`Altius Biosample ID`]
+cres <- cres[rowSums(cres) >= min_samples, ]
+```
+
+```{r}
+cres_regions <- 
+    as.data.frame(rownames(cres)) %>% 
+    tidyr::separate(`rownames(cres)`, into = c('seqnames', 'coords'), sep = '\\:', remove = FALSE) %>% 
+    tidyr::separate(coords, into = c('start', 'end')) %>% 
+    dplyr::select(seqnames, start, end, bin_name = `rownames(cres)`) 
+```
+
+```{r}
+cres.gr <- cres_regions %>% 
+    dplyr::mutate(start = as.numeric(start), end = as.numeric(end)) %>% 
+    dplyr::filter(end > start) %>% 
+    makeGRangesFromDataFrame(., keep.extra.columns = TRUE)
+```
+
+Now we subset the CRE ranges by the extended 33.5 kb ranges around the lead SNP. A minimum overlap of half the size of an RNA bait (always 80 bp) is defined:
+
+```{r}
+ovs <- findOverlaps(gwas_resized, cres.gr, ignore.strand = TRUE, minoverlap = 40)
+gwr <- cres.gr[subjectHits(ovs),]
+```
+
+
+### Add non-CRE-overlapping regions
+
+Some high-confidence regions are not covered by CREs, add them back in manually:
+
+```{r}
+nocre_gwas <- c(
+  GRanges(seqnames = 'chr4', IRanges(start = 89841800, end = 89842600), trait = 'LBD_WGS', group = 'Lewy', rangeid = 'LBD_WGS_SNCAAS1'),
+    GRanges(seqnames = 'chr19', IRanges(start = 44905967, end = 44907391), trait = 'LBD_WGS', group = 'Lewy', rangeid = 'LBD_WGS_APOE'),
+  GRanges(seqnames = 'chr2', IRanges(start = 127134940, end = 127136105), trait = 'LBD_WGS', group = 'Lewy', rangeid = 'LBD_WGS_BIN1')
+)
+gwr <- c(gwr, nocre_gwas)
+```
+
+
+### Some stats
+
+Total number of final cREs and number of final cREs not overlapping with each other:
+
+```{r}
+length(gwr)
+length(reduce(gwr))
+```
+
+Total length of final cREs in bp:
+
+```{r}
+sum(width(reduce(gwr)))
+```
+
+Average length of final cREs in bp:
+
+```{r}
+summary(width(reduce(gwr)))
+```
+
+Number of biotinylated baits needed for non-overlapping representation of final cREs:
+
+```{r}
+sum(width(reduce(gwr))) / 80
+```
+
+
+### Export ROIs
+
+ROIs, or regions of interest, are the ranges that correspond to final testable cREs after they have been staggered/evenly distributed. 
+We first define sliding 80bp long windows over these ranges and then fill in any window that is less than 80 bp in length (since we need to deliver exactly 80 bp for bait design during ordering):
+
+```{r}
+rois <- unlist(slidingWindows(gwr, width = 80L, step = 40L))
+temp <- width(rois) != 80
+table(temp) # showing how many baits need to be filled to 80 bp
+```
+
+```{r}
+toFill <- rois[temp]
+toFill = resize(toFill, fix = 'center', width = 80)
+rois <- rois[!temp]
+rois <- c(rois, toFill)
+```
+
+Sanity check that all baits are 80 bp long:
+
+```{r}
+all(width(rois) == 80)
+```
+
+Final number of baits for ordering:
+
+```{r}
+length(rois)
+```
+
+<!-- ## Check for repeat overlaps -->
+
+<!-- ```{r} -->
+<!-- reps <- read_delim('/earth/public_data/hg38_repeatMasker_UCSC', delim = '\t') %>%  -->
+<!--     makeGRangesFromDataFrame(., seqnames.field = 'genoName', start.field = 'genoStart', end.field = 'genoEnd', strand.field = 'strand', keep.extra.columns = TRUE) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- reps_ovs <- findOverlaps(rois, reps, minoverlap = 40, ignore.strand = TRUE) -->
+<!-- ``` -->
+
+Export as a `bed` file for IGV visualization:
+
+```{r}
+export.bed(rois, '01_export/snca_baits_grch38.bed')
+```
+
+Get fasta and export:
+
+```{r}
+fasta <- getSeq(Hsapiens, rois)
+names(fasta) <- paste0('snca-mpra-', seq(1:length(rois)))
+fasta
+```
+
+```{r}
+writeXStringSet(fasta, '01_export/snca_baits_grch38.fasta')
+saveRDS(rois, '01_export/rois_grch38.rds')
+```
+
+
